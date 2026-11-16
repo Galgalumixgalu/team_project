@@ -87,8 +87,10 @@ static func category(value: int) -> int:
 	return value / 759375
 
 static func hand_key(cards: Array) -> String:
-	var a = cards[0]
-	var b = cards[1]
+	# JSON received over the network may decode card numbers as floats.
+	# Convert them before using them as array indices or with modulo.
+	var a: int = int(cards[0])
+	var b: int = int(cards[1])
 	if rank_of(a) < rank_of(b):
 		var temp = a
 		a = b

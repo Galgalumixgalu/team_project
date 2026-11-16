@@ -2,297 +2,483 @@ extends Control
 
 const Poker = preload("res://poker.gd")
 const Game = preload("res://game.gd")
-const INK = Color("edf3f6")
-const MUTED = Color("a1b3c4")
-const ACCENT = Color("70d6b2")
-const BG = Color("111a24")
+const AggressiveAI = preload("res://ai_strategy.gd")
+const Realtime = preload("res://supabase_realtime.gd")
+const TableUI = preload("res://holdem_table_ui.gd")
+const LobbyUI = preload("res://holdem_lobby_ui.gd")
 const SAMPLE_COUNT = 3000
+const Feedback = preload("res://table_feedback.gd")
+const STAGE_KEYS = ["preflop", "flop", "turn", "river", "showdown"]
+const ACTION_NAMES = {"check": "체크", "call": "콜", "raise": "레이즈", "allin": "올인", "fold": "폴드"}
+var feedback := Feedback.new()
+var guest_locked := false
+var prediction_version := 0
 
 var game = Game.new()
 var rng = RandomNumberGenerator.new()
-var font: Font
-var busy = false
-var odds = [0.0, 0.0, 0.0] # Win, tie, loss percentages.
-var stage_odds = []
-var progress = 0
-var buttons = {}
-var raise_amount: SpinBox
-var calculator: AcceptDialog
-var picks = []
-var calc_button: Button
-var calc_result: Label
-var calc_busy = false
+var busy := false
+var odds: Array = [0.0, 0.0, 0.0]
+var stage_odds: Array = []
+var progress := 0
+var ai_personality := "기존"
+var realtime
+var table_ui
+var lobby_ui
+var network_mode := false
+var network_role := ""
+var game_started := false
+var room_code := ""
+var client_id := ""
+var remote_player_id := ""
+var hello_elapsed := 0.0
 
-func _ready():
+func _ready() -> void:
 	rng.randomize()
-	var system_font = SystemFont.new()
-	system_font.font_names = PackedStringArray(["Malgun Gothic", "Noto Sans CJK KR", "Arial"])
-	font = system_font
-	var ui_theme = Theme.new()
-	ui_theme.default_font = font
-	ui_theme.default_font_size = 16
-	theme = ui_theme
-	build_ui()
-	await start_hand()
+	realtime = Realtime.new()
+	add_child(realtime)
+	realtime.joined.connect(_on_realtime_joined)
+	realtime.message_received.connect(_on_realtime_message)
+	realtime.status_changed.connect(_on_realtime_status)
+	table_ui = TableUI.new()
+	table_ui.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	table_ui.action_requested.connect(play)
+	table_ui.next_requested.connect(next_pressed)
+	table_ui.exit_requested.connect(return_to_main_menu)
+	add_child(table_ui)
+	lobby_ui = LobbyUI.new()
+	lobby_ui.set_anchors_and_offsets_preset(Control.PRESET_FULL_RECT)
+	# 이 Control은 화면 전체를 덮지만, 로비 화면이 닫힌 뒤에도 노드 자체는 남습니다.
+	# 부모가 마우스 입력을 막지 않도록 해야 아래 table_ui의 버튼을 누를 수 있습니다.
+	# 로비가 열릴 때는 holdem_lobby_ui.gd의 overlay가 입력을 받습니다.
+	lobby_ui.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	lobby_ui.offline_selected.connect(_start_offline)
+	lobby_ui.skins_requested.connect(table_ui.skin_picker.open)
+	lobby_ui.online_setup_requested.connect(show_online_setup)
+	lobby_ui.create_room_requested.connect(_start_host_room)
+	lobby_ui.join_room_requested.connect(_start_guest_room)
+	lobby_ui.back_requested.connect(return_to_main_menu)
+	add_child(lobby_ui)
+	add_child(feedback)
+	table_ui.settings_requested.connect(feedback.open_settings)
+	lobby_ui.settings_requested.connect(feedback.open_settings)
+	get_tree().node_added.connect(_wire_click)
+	for button in get_tree().root.find_children("*", "BaseButton", true, false):
+		_wire_click(button)
+	show_main_menu()
+	refresh()
+func _process(delta: float) -> void:
+	if network_mode and network_role == "guest" and not game_started and realtime.joined_ok:
+		hello_elapsed += delta
+		if hello_elapsed >= 2.0:
+			hello_elapsed = 0.0
+			realtime.send_message({"kind": "hello", "from": client_id})
+func _local_seat() -> int:
+	return 1 if network_mode and network_role == "guest" else 0
 
-func box(rect: Rect2, color: Color, radius: int = 12):
-	var style = StyleBoxFlat.new()
-	style.bg_color = color
-	style.set_corner_radius_all(radius)
-	draw_style_box(style, rect)
+func _wire_click(node: Node):
+	if node is BaseButton and not node.pressed.is_connected(feedback.click):
+		node.pressed.connect(feedback.click)
 
-func label_at(s: String, x: float, y: float, pixels: int = 18, color: Color = INK):
-	draw_string(font, Vector2(x, y), s, HORIZONTAL_ALIGNMENT_LEFT, -1, pixels, color)
+func _show_cue(kind: String, code: String, seat: int):
+	var who := "내" if seat == _local_seat() else ("상대" if network_mode else "컴퓨터")
+	match kind:
+		"stage":
+			var index := STAGE_KEYS.find(code)
+			if index >= 0:
+				feedback.slide(Game.STAGES[index], ["개인 카드 배분", "공용 카드 세 장 공개", "네 번째 공용 카드 공개", "마지막 공용 카드 공개", "양쪽 패를 비교합니다"][index], code)
+		"turn":
+			feedback.slide(who + " 차례", "베팅할 차례", "you" if seat == _local_seat() else ("opponent" if network_mode else "computer"))
+		"action":
+			if ACTION_NAMES.has(code):
+				feedback.slide(ACTION_NAMES[code], who + " 행동", code)
 
-func centered(s: String, x: float, y: float, pixels: int = 18, color: Color = INK):
-	label_at(s, x - font.get_string_size(s, HORIZONTAL_ALIGNMENT_LEFT, -1, pixels).x / 2, y, pixels, color)
+func _announce(kind: String, code: String, seat: int = -1):
+	busy = true
+	refresh()
+	if network_mode and network_role == "host":
+		realtime.send_message({"kind":"cue", "from":client_id, "to":remote_player_id, "cue":kind, "code":code, "seat":seat})
+	_show_cue(kind, code, seat)
+	await get_tree().create_timer(Feedback.DURATION).timeout
 
-func chips(value: int) -> String:
-	var s = str(value)
-	var result = ""
-	for i in range(s.length()):
-		if i > 0 and (s.length() - i) % 3 == 0: result += ","
-		result += s[i]
-	return result
-
-func draw_card(value: int, pos: Vector2, hidden: bool = false):
-	var rect = Rect2(pos, Vector2(84, 114))
-	if value < 0:
-		box(rect, Color("20483f"), 9)
-		centered("·", pos.x + 42, pos.y + 65, 30, Color("597c70"))
-	elif hidden:
-		box(rect, Color("324a64"), 9)
-		for i in range(4):
-			for j in range(6): draw_circle(pos + Vector2(15 + i * 18, 14 + j * 17), 2, Color("6b849d"))
-	else:
-		box(rect, Color("f3f3eb"), 9)
-		var suit = int(value / 13)
-		var color = Color("ca505c") if suit in [1, 2] else Color("1e3448")
-		var rank_text = Poker.card_text(value).left(-1)
-		label_at(rank_text, pos.x + 9, pos.y + 26, 22, color)
-		centered(["♠", "♥", "♦", "♣"][suit], pos.x + 42, pos.y + 77, 42, color)
-		label_at(rank_text, pos.x + 57, pos.y + 103, 16, color)
-
-func hand_name(seat: int) -> String:
-	if game.board.size() < 3: return "시작 핸드 " + Poker.hand_key(game.hands[seat])
-	return Poker.NAMES[Poker.category(Poker.evaluate(game.hands[seat] + game.board))]
-
-func _draw():
-	draw_rect(Rect2(0, 0, 1200, 800), BG)
-	label_at("TEXAS HOLD’EM", 30, 45, 27)
-	label_at("기본 대전 + 핸드 승률 예측", 31, 72, 15, MUTED)
-	if game.hands[0].is_empty(): return
-	label_at("핸드 #%d   ·   블라인드 500 / 1,000" % game.hand_no, 30, 109, 14, MUTED)
-	for i in range(5):
-		box(Rect2(30 + i * 168, 125, 158, 36), Color("325649") if game.stage == i else Color("203040"), 7)
-		centered(Game.STAGES[i], 109 + i * 168, 150, 15, ACCENT if game.stage == i else MUTED)
-	box(Rect2(30, 178, 830, 405), Color("173f35"), 36)
-	centered("컴퓨터  ·  " + chips(game.stacks[1]) + " 칩" + ("  [D]" if game.dealer == 1 else ""), 445, 211, 18)
-	var showdown = game.stage == 4
-	draw_card(game.hands[1][0], Vector2(352, 226), not showdown)
-	draw_card(game.hands[1][1], Vector2(450, 226), not showdown)
-	centered(hand_name(1) if showdown else "상대 패는 쇼다운에서 공개됩니다", 445, 363, 14, MUTED)
-	centered("POT   " + chips(game.pot), 445, 403, 25, ACCENT)
-	for i in range(5): draw_card(game.board[i] if i < game.board.size() else -1, Vector2(205 + i * 98, 425))
-	centered("공개 카드", 445, 564, 13, MUTED)
-	draw_card(game.hands[0][0], Vector2(31, 602))
-	draw_card(game.hands[0][1], Vector2(129, 602))
-	label_at("내 칩  " + chips(game.stacks[0]) + ("  [D]" if game.dealer == 0 else ""), 240, 629, 22)
-	label_at(hand_name(0), 240, 660, 18, ACCENT)
-	label_at("현재 베팅  나 %s / 컴퓨터 %s" % [chips(game.paid[0]), chips(game.paid[1])], 240, 691, 13, MUTED)
-	label_at("레이즈 총액", 650, 619, 14, MUTED)
-	box(Rect2(885, 125, 285, 354), Color("1b2b39"))
-	label_at("내 핸드 예상 승률", 907, 158, 20)
-	label_at("%.1f%%" % odds[0], 905, 223, 49, ACCENT)
-	label_at("승리 %.1f%%" % odds[0], 907, 262, 17)
-	label_at("무승부 %.1f%%" % odds[1], 907, 292, 17, MUTED)
-	label_at("패배 %.1f%%" % odds[2], 907, 322, 17, MUTED)
-	label_at("내 카드 + 공개 카드 기준", 907, 365, 14, MUTED)
-	label_at("상대는 임의의 핸드로 가정", 907, 389, 14, MUTED)
-	label_at("계산 중 %d / %d" % [progress, SAMPLE_COUNT] if progress < SAMPLE_COUNT else ("리버: 상대 990가지 전수 계산" if game.board.size() == 5 else "3,000회 시뮬레이션 · 추정치"), 907, 431, 13, ACCENT)
-	label_at("예측은 실제 승패를 보장하지 않습니다", 907, 457, 11, MUTED)
-	box(Rect2(885, 496, 285, 220), Color("1b2b39"))
-	label_at("단계별 예상 승률", 907, 531, 19)
-	for i in range(4):
-		label_at(Game.STAGES[i], 907, 570 + i * 35, 16, MUTED)
-		label_at("%.1f%%" % stage_odds[i] if i < stage_odds.size() else "—", 1080, 570 + i * 35, 17, ACCENT)
-	var status = game.message
+func _advance_stage():
+	await _announce("stage", STAGE_KEYS[game.stage + 1])
+	game.advance()
 	if not game.over:
-		status = ("컴퓨터 판단 중…" if busy else "내 차례") if not game.pending else "베팅 완료 · 다음 단계로 진행하세요"
-	label_at(status, 31, 788, 15, ACCENT)
+		await predict()
 
-func button(key: String, caption: String, rect: Rect2, callback: Callable):
-	var b = Button.new()
-	b.text = caption
-	b.position = rect.position
-	b.size = rect.size
-	var style = StyleBoxFlat.new()
-	style.bg_color = Color("2c455b")
-	style.set_corner_radius_all(8)
-	b.add_theme_stylebox_override("normal", style)
-	var hover = style.duplicate()
-	hover.bg_color = Color("3c5d76")
-	b.add_theme_stylebox_override("hover", hover)
-	b.pressed.connect(callback)
-	add_child(b)
-	buttons[key] = b
+func _show_result():
+	var reason := "쇼다운 결과" if game.stage == 4 else "폴드로 종료"
+	if game.result == 2:
+		feedback.slide("무승부", reason, "draw")
+	elif game.result == _local_seat():
+		feedback.slide("내가 승리했습니다", reason, "win_self")
+	elif network_mode:
+		feedback.slide("상대 플레이어 승리", reason, "win_opponent")
+	else:
+		feedback.slide("컴퓨터 승리", reason, "win_cpu")
 
-func build_ui():
-	button("calculator", "핸드별 승률 계산기", Rect2(950, 32, 220, 45), func(): calculator.popup_centered())
-	raise_amount = SpinBox.new()
-	raise_amount.position = Vector2(650, 634)
-	raise_amount.size = Vector2(210, 44)
-	raise_amount.step = 100
-	add_child(raise_amount)
-	button("fold", "폴드", Rect2(30, 731, 105, 39), func(): await play("fold"))
-	button("call", "체크 / 콜", Rect2(145, 731, 160, 39), func(): await play("call"))
-	button("raise", "레이즈", Rect2(315, 731, 115, 39), func():
-		raise_amount.apply()
-		await play("raise", int(raise_amount.value)))
-	button("allin", "올인", Rect2(440, 731, 105, 39), func(): await play("allin"))
-	button("next", "다음 단계", Rect2(555, 731, 305, 39), next_pressed)
-	calculator = AcceptDialog.new()
-	calculator.title = "시작 핸드별 승률 예측"
-	calculator.min_size = Vector2i(630, 390)
-	add_child(calculator)
-	var column = VBoxContainer.new()
-	column.add_theme_constant_override("separation", 18)
-	calculator.add_child(column)
-	var explanation = Label.new()
-	explanation.text = "카드 두 장을 선택하면 해당 시작 핸드의 승률을 예측합니다.\n공개 카드 없이 임의의 상대 1명과 대결하는 조건입니다."
-	column.add_child(explanation)
-	var row = HBoxContainer.new()
-	row.add_theme_constant_override("separation", 18)
-	column.add_child(row)
-	for i in range(2):
-		var pick = OptionButton.new()
-		pick.custom_minimum_size = Vector2(220, 42)
-		for c in range(52): pick.add_item(Poker.card_text(c), c)
-		pick.select(12 if i == 0 else 25)
-		pick.item_selected.connect(func(_index): calc_result.text = "새 핸드를 선택했습니다. 계산을 눌러 주세요.")
-		picks.append(pick)
-		row.add_child(pick)
-	calc_button = Button.new()
-	calc_button.text = "이 핸드 승률 계산 (5,000회)"
-	calc_button.custom_minimum_size.y = 42
-	calc_button.pressed.connect(calculate_custom_hand)
-	column.add_child(calc_button)
-	calc_result = Label.new()
-	calc_result.text = "카드 선택 후 계산을 누르세요.\ns = 같은 무늬 / o = 다른 무늬"
-	calc_result.custom_minimum_size = Vector2(580, 110)
-	column.add_child(calc_result)
+func _announce_result():
+	busy = true
+	refresh()
+	_send_game_state(true)
+	_show_result()
+	await get_tree().create_timer(Feedback.DURATION).timeout
 
-func refresh():
-	var enabled = not busy and not game.over and not game.pending and game.actor == 0
-	for key in ["fold", "call", "raise", "allin"]: buttons[key].disabled = not enabled
-	buttons.call.text = "체크" if game.owed(0) == 0 else "콜 " + chips(mini(game.owed(0), game.stacks[0]))
-	buttons.raise.disabled = not enabled or not game.raise_possible(0) or game.max_target(0) < game.paid.max() + game.min_raise
-	buttons.allin.disabled = not enabled or (game.max_target(0) > game.paid.max() and not game.raise_possible(0))
-	raise_amount.max_value = game.max_target(0)
-	raise_amount.min_value = mini(game.paid.max() + game.min_raise, game.max_target(0))
-	raise_amount.editable = not buttons.raise.disabled
-	buttons.next.disabled = busy or (not game.pending and not game.over)
-	buttons.next.text = ("새 매치 · 각 50,000칩" if game.stacks.min() == 0 else "다음 핸드") if game.over else ("쇼다운" if game.stage == 3 else "다음 카드 공개")
-	buttons.calculator.disabled = busy
-	queue_redraw()
+func _accept_action(seat: int, kind: String, target: int):
+	var spoken := kind
+	if kind == "call" and game.owed(seat) == 0: spoken = "check"
+	if not game.action(seat, kind, target): return false
+	await _announce("action", spoken, seat)
+	return true
 
 func start_hand():
+	if network_mode and network_role == "guest":
+		return
+	if not network_mode:
+		ai_personality = AggressiveAI.pick_personality(rng)
+	await _announce("stage", "preflop")
 	game.new_hand()
 	stage_odds.clear()
 	await predict()
 	await drive()
-
 func predict():
+	prediction_version += 1
+	var version := prediction_version
 	busy = true
 	progress = 0
 	refresh()
 	var wins = 0.0
 	var ties = 0.0
+	var hero_cards = game.hands[_local_seat()]
 	if game.board.size() == 5:
 		await get_tree().process_frame
-		var counts = Poker.river_prediction(game.hands[0], game.board)
+		if version != prediction_version: return
+		var counts = Poker.river_prediction(hero_cards, game.board)
 		odds = [counts[0] * 100 / counts[2], counts[1] * 100 / counts[2], (counts[2] - counts[0] - counts[1]) * 100 / counts[2]]
 	else:
 		while progress < SAMPLE_COUNT:
-			# Neither the actual opponent's cards nor burned cards are known to the player.
-			var counts = Poker.sample(game.hands[0], game.board, [], 60, rng)
+			var counts = Poker.sample(hero_cards, game.board, [], 60, rng)
 			wins += counts[0]
 			ties += counts[1]
 			progress += 60
 			odds = [wins * 100 / progress, ties * 100 / progress, (progress - wins - ties) * 100 / progress]
-			queue_redraw()
+			refresh()
 			await get_tree().process_frame
+			if version != prediction_version: return
 	progress = SAMPLE_COUNT
 	stage_odds.append(odds[0])
 	busy = false
 	refresh()
-
 func play(kind: String, target: int = 0):
-	if busy: return
-	if game.action(0, kind, target): await drive()
-
+	if busy or guest_locked or not game_started:
+		return
+	var seat := _local_seat()
+	if network_mode and network_role == "guest":
+		busy = true
+		if not realtime.send_message({"kind": "action", "from": client_id, "action": kind, "target": target}):
+			busy = false
+			game.message = "연결이 끊겼습니다. 방에 다시 참가해 주세요."
+		refresh()
+		return
+	if await _accept_action(seat, kind, target):
+		await drive()
 func next_pressed():
-	if busy: return
-	if game.over: await start_hand()
+	if busy or guest_locked or not game_started:
+		return
+	if network_mode and network_role == "guest":
+		busy = true
+		if not realtime.send_message({"kind": "next", "from": client_id}):
+			busy = false
+			game.message = "연결이 끊겼습니다. 방에 다시 참가해 주세요."
+		refresh()
+		return
+	if game.over:
+		await start_hand()
 	elif game.pending:
-		game.advance()
-		if not game.over: await predict()
+		await _advance_stage()
 		await drive()
 
-func drive():
+func drive() -> void:
+	if network_mode:
+		while not game.over and game.pending and game.stacks.min() == 0:
+			_send_game_state(true)
+			await _advance_stage()
+		if not game.over and not game.pending:
+			_send_game_state(true)
+			await _announce("turn", "", game.actor)
+		if game.over:
+			await _announce_result()
+		busy = false
+		_send_game_state()
+		refresh()
+		return
 	while not game.over:
 		refresh()
 		if game.pending:
 			if game.stacks.min() == 0:
-				busy = true
-				refresh()
-				await get_tree().create_timer(0.5).timeout
-				game.advance()
-				busy = false
-				if not game.over: await predict()
+				await _advance_stage()
 				continue
 			break
-		if game.actor == 0: break
+		await _announce("turn", "", game.actor)
+		if game.actor == 0:
+			break
 		busy = true
 		refresh()
 		await get_tree().create_timer(0.35).timeout
-		var sums = [0.0, 0.0]
-		for i in range(6):
-			var batch = Poker.sample(game.hands[1], game.board, [], 50, rng)
-			sums[0] += batch[0]
-			sums[1] += batch[1]
-			await get_tree().process_frame
-		var strength = (sums[0] + sums[1] / 2) / 300
-		var cost = mini(game.owed(1), game.stacks[1])
-		var pot_odds = float(cost) / maxf(1, game.pot + cost)
-		if cost > 0 and strength < pot_odds - 0.04:
-			game.action(1, "fold")
-		elif game.raise_possible(1) and (strength > 0.67 or rng.randf() < 0.05):
-			game.action(1, "raise", mini(game.max_target(1), game.paid.max() + maxi(game.min_raise, int(game.pot * 0.5))))
-		else: game.action(1, "call")
+		var decision: Dictionary = AggressiveAI.choose_betting_action(
+			game.hands[1], game.board, game.owed(1), game.raise_possible(1),
+			game.max_target(1), int(game.paid.max()), game.min_raise, game.pot,
+			game.stacks[1], ai_personality, rng
+		)
+		await _accept_action(1, str(decision.get("action", "call")), int(decision.get("target", 0)))
 		busy = false
+	if game.over:
+		await _announce_result()
+	busy = false
+	refresh()
+func _make_room_code() -> String:
+	const alphabet := "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+	var code := ""
+	for i in range(8):
+		code += alphabet[rng.randi_range(0, alphabet.length() - 1)]
+	return code
+func _make_client_id() -> String:
+	return "%d_%08x" % [Time.get_ticks_usec(), rng.randi()]
+func _on_realtime_joined() -> void:
+	if not network_mode:
+		return
+	if network_role == "host":
+		lobby_ui.show_waiting_status("방 코드: %s\n연결됐습니다. 친구가 이 코드를 입력할 때까지 기다리세요." % room_code)
+	else:
+		hello_elapsed = 2.0
+		lobby_ui.show_waiting_status("방에 연결됐습니다. 호스트 응답을 기다리는 중…")
+func _on_realtime_message(message: Dictionary) -> void:
+	if not network_mode:
+		return
+	var sender := str(message.get("from", ""))
+	var kind := str(message.get("kind", ""))
+	if sender.is_empty() or sender == client_id:
+		return
+	if network_role == "host":
+		if kind == "hello":
+			if not remote_player_id.is_empty() and remote_player_id != sender:
+				realtime.send_message({"kind": "reject", "from": client_id, "to": sender, "reason": "이 방은 이미 두 명이 사용 중입니다."})
+				return
+			remote_player_id = sender
+			realtime.send_message({"kind": "welcome", "from": client_id, "to": sender})
+			if not game_started:
+				game_started = true
+				lobby_ui.show_table()
+				await start_hand()
+			elif not busy:
+				_send_game_state()
+			return
+		if sender != remote_player_id:
+			return
+		if busy: return
+		if kind == "action":
+			if game_started and game.actor == 1 and not game.pending and not game.over:
+				var action_name := str(message.get("action", ""))
+				var target := int(message.get("target", 0))
+				if await _accept_action(1, action_name, target):
+					await drive()
+				else:
+					_send_game_state()
+			else:
+				_send_game_state()
+		elif kind == "next":
+			if game_started and game.over:
+				await start_hand()
+			elif game_started and game.pending:
+				await _advance_stage()
+				await drive()
+			else:
+				_send_game_state()
+	else:
+		if kind == "reject":
+			if lobby_ui.status_label != null:
+				lobby_ui.show_waiting_status(str(message.get("reason", "방에 참가할 수 없습니다.")))
+			return
+		if kind == "welcome":
+			remote_player_id = sender
+			if lobby_ui.status_label != null:
+				lobby_ui.show_waiting_status("호스트와 연결됐습니다. 게임 정보를 기다리는 중…")
+			return
+		if sender != remote_player_id and not remote_player_id.is_empty():
+			return
+		if kind == "cue" and sender == remote_player_id:
+			guest_locked = true
+			lobby_ui.show_table()
+			_show_cue(str(message.get("cue", "")), str(message.get("code", "")), int(message.get("seat", -1)))
+			refresh()
+			return
+		if kind == "state":
+			remote_player_id = sender
+			await _apply_game_state(message)
+func _send_game_state(locked := false) -> void:
+	if not network_mode or network_role != "host" or remote_player_id.is_empty() or not game_started:
+		return
+	var revealed_hands: Array = game.hands if game.stage == 4 else []
+	var snapshot := {
+		"kind": "state",
+		"locked": locked,
+		"from": client_id,
+		"to": remote_player_id,
+		"hand_no": game.hand_no,
+		"stage": game.stage,
+		"stacks": game.stacks,
+		"paid": game.paid,
+		"acted": game.acted,
+		"can_raise": game.can_raise,
+		"board": game.board,
+		"pot": game.pot,
+		"dealer": game.dealer,
+		"actor": game.actor,
+		"min_raise": game.min_raise,
+		"pending": game.pending,
+		"over": game.over,
+		"result": game.result,
+		"message": game.message,
+		"private_hand": game.hands[1],
+		"revealed_hands": revealed_hands
+	}
+	realtime.send_message(snapshot)
+func _apply_game_state(snapshot: Dictionary) -> void:
+	var was_over: bool = game.over
+	guest_locked = snapshot.get("locked", false)
+	var old_hand_no: int = int(game.hand_no)
+	var old_board: String = str(game.board)
+	game.hand_no = int(snapshot.get("hand_no", game.hand_no))
+	game.stage = int(snapshot.get("stage", game.stage))
+	game.stacks = snapshot.get("stacks", game.stacks)
+	game.paid = snapshot.get("paid", game.paid)
+	game.acted = snapshot.get("acted", game.acted)
+	game.can_raise = snapshot.get("can_raise", game.can_raise)
+	game.board = snapshot.get("board", game.board)
+	game.pot = int(snapshot.get("pot", game.pot))
+	game.dealer = int(snapshot.get("dealer", game.dealer))
+	game.actor = int(snapshot.get("actor", game.actor))
+	game.min_raise = int(snapshot.get("min_raise", game.min_raise))
+	game.pending = bool(snapshot.get("pending", game.pending))
+	game.over = bool(snapshot.get("over", game.over))
+	game.result = int(snapshot.get("result", game.result))
+	game.message = str(snapshot.get("message", game.message))
+	var revealed: Array = snapshot.get("revealed_hands", [])
+	if revealed.size() == 2:
+		game.hands = [revealed[0], revealed[1]]
+	else:
+		game.hands = [[], []]
+		game.hands[1] = snapshot.get("private_hand", [])
+	if old_hand_no != game.hand_no:
+		stage_odds.clear()
+	game_started = true
+	lobby_ui.show_table()
+	if game.over and (not was_over or old_hand_no != game.hand_no):
+		_show_result()
+	var should_predict: bool = old_hand_no != int(game.hand_no) or old_board != str(game.board)
+	if should_predict and game.hands[1].size() == 2:
+		await predict()
+	else:
+		if not busy or progress == SAMPLE_COUNT: busy = false
+		refresh()
+func _start_offline() -> void:
+	StatsTracker.set_lobby_visible(false)
+	network_mode = false
+	network_role = ""
+	game_started = true
+	game = Game.new()
+	lobby_ui.show_table()
+	refresh()
+	await start_hand()
+
+func show_main_menu() -> void:
+	StatsTracker.set_lobby_visible(true)
+	lobby_ui.show_main_menu()
 	refresh()
 
-func calculate_custom_hand():
-	if calc_busy: return
-	var selected = [picks[0].get_selected_id(), picks[1].get_selected_id()]
-	if selected[0] == selected[1]:
-		calc_result.text = "같은 카드를 두 번 선택할 수 없습니다."
+func show_online_setup() -> void:
+	StatsTracker.set_lobby_visible(false)
+	var config := ConfigFile.new()
+	config.load("user://holdem_supabase.cfg")
+	lobby_ui.show_online_setup(str(config.get_value("supabase", "url", "")), str(config.get_value("supabase", "public_key", "")))
+
+func _start_host_room(url: String, key: String) -> void:
+	_start_online(true, url, key, "")
+
+func _start_guest_room(url: String, key: String, code: String) -> void:
+	_start_online(false, url, key, code)
+
+func _start_online(as_host: bool, url: String, key: String, entered_code: String) -> void:
+	url = url.strip_edges()
+	key = key.strip_edges()
+	entered_code = entered_code.strip_edges().to_upper()
+	if url.is_empty() or key.is_empty():
+		lobby_ui.show_waiting_status("Supabase 프로젝트 URL과 공개 키를 입력해 주세요.")
 		return
-	calc_busy = true
-	calc_button.disabled = true
-	for pick in picks: pick.disabled = true
-	var custom_rng = RandomNumberGenerator.new()
-	custom_rng.randomize()
-	var wins = 0.0
-	var ties = 0.0
-	for i in range(100):
-		var sample = Poker.sample(selected, [], [], 50, custom_rng)
-		wins += sample[0]
-		ties += sample[1]
-		calc_result.text = "%s · 계산 중 %d / 5,000" % [Poker.hand_key(selected), (i + 1) * 50]
-		await get_tree().process_frame
-	calc_result.text = "%s  (%s, %s)\n승리 %.1f%%  ·  무승부 %.1f%%  ·  패배 %.1f%%\n5,000회 시뮬레이션 추정치 · 상대 행동/성향은 반영하지 않음" % [Poker.hand_key(selected), Poker.card_text(selected[0]), Poker.card_text(selected[1]), wins / 50, ties / 50, (5000 - wins - ties) / 50]
-	for pick in picks: pick.disabled = false
-	calc_button.disabled = false
-	calc_busy = false
+	if not as_host and entered_code.is_empty():
+		lobby_ui.show_waiting_status("참가하려면 친구에게 받은 방 코드를 입력해 주세요.")
+		return
+	var config := ConfigFile.new()
+	config.set_value("supabase", "url", url)
+	config.set_value("supabase", "public_key", key)
+	var save_error := config.save("user://holdem_supabase.cfg")
+	if save_error != OK:
+		lobby_ui.show_waiting_status("설정을 이 기기에 저장하지 못했습니다. 다시 시도해 주세요.")
+		return
+	network_mode = true
+	network_role = "host" if as_host else "guest"
+	game_started = false
+	remote_player_id = ""
+	room_code = _make_room_code() if as_host else entered_code
+	client_id = _make_client_id()
+	game = Game.new()
+	if as_host:
+		lobby_ui.room_input.text = room_code
+		lobby_ui.show_waiting_status("방 코드: %s\n친구에게 이 코드를 보내고, 참가할 때까지 기다리세요." % room_code)
+	else:
+		lobby_ui.show_waiting_status("방 %s 에 연결하는 중…" % room_code)
+	if not realtime.connect_room(url, key, room_code, client_id):
+		network_mode = false
+	refresh()
+
+func _on_realtime_status(text: String) -> void:
+	if lobby_ui.status_label != null:
+		lobby_ui.show_waiting_status(text)
+	elif network_mode and game_started:
+		game.message = "연결 상태: " + text
+		refresh()
+
+func refresh() -> void:
+	if not is_instance_valid(table_ui):
+		return
+	table_ui.update_state({
+		"game": game,
+		"busy": busy or guest_locked,
+		"game_started": game_started,
+		"network_mode": network_mode,
+		"network_role": network_role,
+		"ai_personality": ai_personality,
+		"odds": odds,
+		"stage_odds": stage_odds,
+		"progress": progress
+	})
+
+func return_to_main_menu() -> void:
+	guest_locked = false
+	prediction_version += 1
+	realtime.close_room()
+	network_mode = false
+	network_role = ""
+	game_started = false
+	busy = false
+	room_code = ""
+	client_id = ""
+	remote_player_id = ""
+	hello_elapsed = 0.0
+	game = Game.new()
+	odds = [0.0, 0.0, 0.0]
+	stage_odds.clear()
+	progress = 0
+	StatsTracker.set_lobby_visible(true)
+	lobby_ui.show_main_menu()
+	refresh()

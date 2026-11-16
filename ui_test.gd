@@ -11,6 +11,7 @@ func wait_ready():
 	await process_frame
 
 func run():
+	await scene._start_offline()
 	await wait_ready()
 	assert(scene.stage_odds.size() == 1)
 	assert(absf(scene.odds[0] + scene.odds[1] + scene.odds[2] - 100) < 0.001)
@@ -27,16 +28,16 @@ func run():
 	assert(scene.odds == first)
 	scene.game.hands[1] = saved_hand
 	scene.stage_odds = [scene.odds[0]]
-	scene.calculator.popup_centered()
-	await scene.calculate_custom_hand()
-	assert(scene.calc_result.text.contains("AA"))
-	assert(scene.calc_result.text.contains("패배"))
+	scene.table_ui.calculator.popup_centered()
+	await scene.table_ui.calculate_custom_hand()
+	assert(scene.table_ui.calc_result.text.contains("AA"))
+	assert(scene.table_ui.calc_result.text.contains("패배"))
 	await process_frame
 	root.get_texture().get_image().save_png("res://calculator_preview.png")
-	scene.picks[1].select(scene.picks[0].selected)
-	await scene.calculate_custom_hand()
-	assert(scene.calc_result.text.contains("같은 카드"))
-	scene.calculator.hide()
+	scene.table_ui.picks[1].select(scene.table_ui.picks[0].selected)
+	await scene.table_ui.calculate_custom_hand()
+	assert(scene.table_ui.calc_result.text.contains("같은 카드"))
+	scene.table_ui.calculator.hide()
 	var guard = 0
 	while not scene.game.over and guard < 60:
 		guard += 1
